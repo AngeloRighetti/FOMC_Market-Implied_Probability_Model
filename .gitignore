@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# System & IDE
+.DS_Store
+.vscode/
+
+# Dati grezzi (non tracciare file pesanti)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
