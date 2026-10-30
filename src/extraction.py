@@ -88,11 +88,11 @@ def extract_meeting_probabilities(r_post: float, r_pre: float, step: float = 0.2
 
     Returns:
     - tuple: (h_m, lower_step, p_low, upper_step, p_high)
-      * h_m:        Expected move normalized in step units ((r_post - r_pre) / step).
-      * lower_step: Base rate adjustment in percentage points (s_m * k_m * step).
-      * p_low:      Probability assigned to the base step (1.0 - alpha_m).
-      * upper_step: Incremental rate adjustment (s_m * (k_m + 1) * step).
-      * p_high:     Probability assigned to the incremental step (alpha_m).
+      - h_m:        Expected move normalized in step units ((r_post - r_pre) / step).
+      - lower_step: Base rate adjustment in percentage points (s_m * k_m * step).
+      - p_low:      Probability assigned to the base step (1.0 - alpha_m).
+      - upper_step: Incremental rate adjustment (s_m * (k_m + 1) * step).
+      - p_high:     Probability assigned to the incremental step (alpha_m).
     """
     h_m = (r_post - r_pre) / step
 

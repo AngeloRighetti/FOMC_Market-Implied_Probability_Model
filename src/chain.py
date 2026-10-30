@@ -1,3 +1,8 @@
+"""
+Orchestration module for FOMC Forward Chaining and discrete convolution.
+Implements the sequential timeline across all calendar months (Section 5.2).
+"""
+
 from typing import Any
 from extraction import (
     resolve_post_meeting_rate,
@@ -33,7 +38,7 @@ def run_forward_chain(
         else:
             next_month_has_meeting = False
             r_avg_next = None
-        
+
         if m_m is not None:
             # 1. Calcolo del tasso post-meeting con eventuale Next-Month Rule
             r_post = resolve_post_meeting_rate(
@@ -77,8 +82,12 @@ def run_forward_chain(
 
             # 5. Propagazione del tasso post-meeting (Eq. 20)
             r_pre = r_post
-        
+        else:
+            # CASO B: Anchor Month (nessun meeting, Eq. 19)
+            r_pre = r_avg
+
     return results
+
 
 if __name__ == "__main__":
     from calendar_data import CALENDAR_2026
@@ -87,7 +96,6 @@ if __name__ == "__main__":
     starting_effr = 4.33
 
     # 2. Curva forward simulata dei Fed Funds (R_avg = 100 - Prezzo Future)
-    # Mostra un mercato che sconta un graduale allentamento monetario
     sample_futures_rates = {
         1: 4.28,   # Gennaio (Meeting il 28)
         2: 4.20,   # Febbraio (Anchor Month)
