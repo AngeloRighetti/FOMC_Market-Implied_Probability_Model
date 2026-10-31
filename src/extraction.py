@@ -36,42 +36,25 @@ def resolve_post_meeting_rate(
     threshold_l: int = 7,
 ) -> float:
     """
-    Section 4.4 (Eq. 11): Post-meeting rate estimator with Next-Month Rule.
-    
-    When a meeting occurs near month-end (remaining days n_m - m_m < threshold_l),
-    the standard estimator amplifies market microstructure noise. If the subsequent
-    month has no FOMC meeting, the rate is read directly from the m+1 contract (r_avg_next).
-    Otherwise, it falls back to the standard own-month estimator (Eq. 7).
-
-    Parameters:
-    - next_month_has_meeting: True if month m+1 hosts an FOMC meeting, False otherwise.
-    - r_avg:                  Average rate implied by the month m future contract.
-    - r_pre:                  Prevailing rate prior to the meeting decision.
-    - n_m:                    Total calendar days in month m.
-    - m_m:                    Decision day of the FOMC meeting.
-    - r_avg_next:             Average rate of the month m+1 contract (required for next-month rule).
-    - threshold_l:            Critical threshold of remaining days (default = 7, per paper).
-
-    Returns:
-    - float: Resolved post-meeting rate.
+    Resolves the post-meeting policy rate according to methodology Section 5.2.
+    Applies the Next-Month Rule (Eq. 11) when days_remaining < threshold_l and
+    no meeting occurs in month m+1. Gracefully falls back to Eq. 7 at the boundary.
     """
     days_remaining = n_m - m_m
 
-    # Case 1: Sufficient remaining days -> use standard own-month estimator
+    # Case 1: Sufficient remaining days in the month -> standard own-month estimator (Eq. 7)
     if days_remaining >= threshold_l:
-        r_post = extract_post_meeting_rate(r_avg, r_pre, n_m, m_m)
+        return extract_post_meeting_rate(r_avg=r_avg, r_pre=r_pre, n_m=n_m, m_m=m_m)
 
-    # Case 2: Late-month meeting AND next month is an anchor (no meeting) -> Eq. 11
-    elif days_remaining < threshold_l and not next_month_has_meeting:
-        if r_avg_next is None:
-            raise ValueError("r_avg_next must be provided when applying the next-month rule.")
-        r_post = r_avg_next
+    # Case 2: Late-month meeting and subsequent month is an anchor (no meeting)
+    if days_remaining < threshold_l and not next_month_has_meeting:
+        if r_avg_next is not None:
+            return r_avg_next
+        # Boundary fallback: if at the end of the available curve, fall back to Eq. 7
+        return extract_post_meeting_rate(r_avg=r_avg, r_pre=r_pre, n_m=n_m, m_m=m_m)
 
-    # Case 3: Late-month meeting BUT next month also has a meeting -> fallback to Eq. 7
-    else:
-        r_post = extract_post_meeting_rate(r_avg, r_pre, n_m, m_m)
-
-    return r_post
+    # Case 3: Late-month meeting but subsequent month also has a meeting -> Eq. 7
+    return extract_post_meeting_rate(r_avg=r_avg, r_pre=r_pre, n_m=n_m, m_m=m_m)
 
 
 def extract_meeting_probabilities(r_post: float, r_pre: float, step: float = 0.25):
