@@ -1,199 +1,248 @@
 """
-Main entry point for extracting market-implied FOMC policy probabilities.
-Fetches real-time EFFR from NY Fed, applies actual Fed Funds futures pricing,
-and displays meeting probabilities and cumulative distributions.
+FOMC Market-Implied Probability Model
+Single-file execution script with manual data inputs.
+Reference: methodology.pdf
 """
 
 import os
 import sys
-from datetime import date
-from pathlib import Path
 
-SRC_DIR = Path(__file__).resolve().parent / "src"
-sys.path.append(str(SRC_DIR))
+# =========================================================================
+# 1. MANUAL INPUT SECTION (Update these values based on current market data)
+# =========================================================================
 
-from calendar_data import get_active_calendar
-from chain import run_forward_chain
-from data_feed import (
-    get_spot_effr,
-    fetch_market_implied_rates,
-)
+# The current observation date and base rate (Effective Federal Funds Rate)
+AS_OF_DATE = "2026-10-31"
+SPOT_EFFR = 3.880
 
-# ---------------------------------------------------------------------------
-# Terminal rendering helpers
-# ---------------------------------------------------------------------------
+# 30-Day Fed Funds Futures (CME ZQ) Settlement Prices
+# Format: (Year, Month): Price
+FUTURES_PRICES = {
+    (2026, 12): 95.937,  # Implies 4.063%
+    (2027, 1):  95.847,  # Implies 4.153%
+    (2027, 2):  95.847,  # Anchor month (No meeting)
+    (2027, 3):  95.745,  # Implies 4.255%
+    (2027, 4):  95.654,  # Implies 4.346%
+    (2027, 5):  95.654,  # Anchor month (No meeting)
+    (2027, 6):  95.593,  # Implies 4.407%
+    (2027, 7):  95.568,  # Implies 4.432%
+    (2027, 8):  95.568,  # Anchor month (No meeting)
+    (2027, 9):  95.561,  # Implies 4.439%
+    (2027, 10): 95.565,  # Implies 4.435%
+}
+
+# The active calendar of upcoming FOMC meetings. 
+# Remove past meetings manually to keep the horizon clean.
+FOMC_CALENDAR = [
+    {"year": 2026, "month": 12, "days_in_month": 31, "decision_day": 9},
+    {"year": 2027, "month": 1,  "days_in_month": 31, "decision_day": 27},
+    {"year": 2027, "month": 2,  "days_in_month": 28, "decision_day": None}, # No meeting
+    {"year": 2027, "month": 3,  "days_in_month": 31, "decision_day": 17},
+    {"year": 2027, "month": 4,  "days_in_month": 30, "decision_day": 28},
+    {"year": 2027, "month": 5,  "days_in_month": 31, "decision_day": None},
+    {"year": 2027, "month": 6,  "days_in_month": 30, "decision_day": 9},
+    {"year": 2027, "month": 7,  "days_in_month": 31, "decision_day": 28},
+    {"year": 2027, "month": 8,  "days_in_month": 31, "decision_day": None},
+    {"year": 2027, "month": 9,  "days_in_month": 30, "decision_day": 15},
+    {"year": 2027, "month": 10, "days_in_month": 31, "decision_day": 27},
+]
+
+
+# =========================================================================
+# 2. MATHEMATICAL CORE (Referencing methodology.pdf)
+# =========================================================================
+
+def extract_post_meeting_rate(r_avg: float, r_pre: float, n_m: int, m_m: int) -> float:
+    """
+    Eq. 7: Implied post-meeting rate for a standard meeting month.
+    Extracts the expected target rate assuming the policy change occurs on day m_m.
+    """
+    return (n_m * r_avg - m_m * r_pre) / (n_m - m_m)
+
+def resolve_post_meeting_rate(
+    next_month_has_meeting: bool, r_avg: float, r_pre: float, 
+    n_m: int, m_m: int, r_avg_next: float | None
+) -> float:
+    """
+    Eq. 11 (Next-Month Rule): Handles standard and late-month meetings.
+    Prevents calculation spikes when m_m is close to the end of the month (n_m).
+    """
+    days_remaining = n_m - m_m
+    
+    # Case 1: Standard meeting (>= 7 days left in the month) -> Use Eq. 7
+    if days_remaining >= 7:
+        return extract_post_meeting_rate(r_avg, r_pre, n_m, m_m)
+    
+    # Case 2: Late-month meeting AND next month is an anchor (no meeting) -> Use Eq. 11
+    if days_remaining < 7 and not next_month_has_meeting:
+        if r_avg_next is not None:
+            return r_avg_next # The next month's average fully reflects the post-meeting rate
+        # Boundary fallback if curve ends
+        return extract_post_meeting_rate(r_avg, r_pre, n_m, m_m)
+        
+    # Case 3: Late-month meeting but next month also has a meeting -> Use Eq. 7
+    return extract_post_meeting_rate(r_avg, r_pre, n_m, m_m)
+
+def extract_meeting_probabilities(r_post: float, r_pre: float, step: float = 0.25) -> tuple:
+    """
+    Eq. 14-17: Decomposes the expected rate change into two discrete 25 bps policy steps.
+    Returns: continuous change (h_m), lower step, prob lower, upper step, prob upper.
+    """
+    h_m = (r_post - r_pre) / step
+    # Determine the number of standard steps (k_m)
+    k_m = int(h_m) if h_m >= 0 else int(h_m) - (1 if h_m % 1 != 0 else 0)
+    
+    lower_step = k_m * step
+    upper_step = (k_m + 1) * step
+    
+    p_high = h_m - k_m
+    p_low = 1.0 - p_high
+    
+    return h_m, lower_step, p_low, upper_step, p_high
+
+def convolve_meeting_step(
+    current_dist: dict[float, float], lower_step: float, 
+    p_low: float, upper_step: float, p_high: float
+) -> dict[float, float]:
+    """
+    Eq. 23: Discrete convolution to update the cumulative probability distribution.
+    Propagates uncertainty meeting-by-meeting through the tree of possible rate paths.
+    """
+    new_dist: dict[float, float] = {}
+    
+    for cum_change, prob in current_dist.items():
+        if p_low > 0:
+            c1 = round(cum_change + lower_step, 4)
+            new_dist[c1] = new_dist.get(c1, 0.0) + (prob * p_low)
+        if p_high > 0:
+            c2 = round(cum_change + upper_step, 4)
+            new_dist[c2] = new_dist.get(c2, 0.0) + (prob * p_high)
+            
+    return new_dist
+
+def run_forward_chain() -> list[dict]:
+    """
+    Section 5.2 (Forward Chaining): Orchestrates the propagation of rates 
+    and probabilities chronologically through the FOMC calendar.
+    """
+    results = []
+    current_dist = {0.0: 1.0}
+    r_pre = SPOT_EFFR
+    
+    # Convert futures prices to average implied rates (R = 100 - P)
+    implied_rates = {k: round(100.0 - v, 4) for k, v in FUTURES_PRICES.items()}
+
+    for idx, month_data in enumerate(FOMC_CALENDAR):
+        y, m = month_data["year"], month_data["month"]
+        n_m, m_m = month_data["days_in_month"], month_data["decision_day"]
+        
+        key = (y, m)
+        if key not in implied_rates:
+            continue
+            
+        r_avg = implied_rates[key]
+        
+        # Lookahead logic for the Next-Month Rule (Eq. 11)
+        if idx + 1 < len(FOMC_CALENDAR):
+            next_m = FOMC_CALENDAR[idx + 1]
+            next_has_meeting = next_m["decision_day"] is not None
+            r_avg_next = implied_rates.get((next_m["year"], next_m["month"]))
+        else:
+            next_has_meeting = False
+            r_avg_next = None
+
+        if m_m is not None:
+            # Step 1: Calculate post-meeting rate
+            r_post = resolve_post_meeting_rate(next_has_meeting, r_avg, r_pre, n_m, m_m, r_avg_next)
+            # Step 2: Extract branch probabilities
+            h_m, l_step, p_low, u_step, p_high = extract_meeting_probabilities(r_post, r_pre)
+            # Step 3: Update cumulative distribution
+            current_dist = convolve_meeting_step(current_dist, l_step, p_low, u_step, p_high)
+            
+            # Save results
+            results.append({
+                "year": y, "month": m, "day": m_m,
+                "r_pre": r_pre, "r_post": r_post, "exp_change": r_post - r_pre,
+                "l_step": l_step, "p_low": p_low, "u_step": u_step, "p_high": p_high,
+                "cum_dist": current_dist.copy()
+            })
+            r_pre = r_post
+        else:
+            # Anchor month: Pre-rate carries over naturally
+            r_pre = r_avg
+            
+    return results
+
+
+# =========================================================================
+# 3. TERMINAL RENDERING DASHBOARD
+# =========================================================================
+
+# Ensure block characters render correctly on all operating systems
 try:
     sys.stdout.reconfigure(encoding="utf-8")
-except (AttributeError, ValueError):
+except:
     pass
-
 if os.name == "nt":
     os.system("")
 
-USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+def print_dashboard(results: list[dict]):
+    """Renders the formatted results to the terminal output."""
+    def fmt_bp(v: float, dec: int = 1) -> str:
+        bp = v * 100.0
+        return f"{0:.{dec}f} bp" if round(bp, dec) == 0 else f"{bp:+.{dec}f} bp"
 
+    def hbar(frac: float, width: int = 30) -> str:
+        eighths = round(max(0.0, min(1.0, frac)) * width * 8)
+        full, rem = divmod(eighths, 8)
+        return "█" * full + (" ▏▎▍▌▋▊▉█"[rem] if rem else "")
 
-def _style(text: str, code: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
-
-
-def bold(text: str) -> str:
-    return _style(text, "1")
-
-
-def dim(text: str) -> str:
-    return _style(text, "2")
-
-
-INDENT = "  "
-GAP = "  "
-
-COLUMNS = [
-    ("Meeting", 12, "<"),
-    ("Pre", 7, ">"),
-    ("Post", 7, ">"),
-    ("Exp. move", 10, ">"),
-    ("Step", 7, ">"),
-    ("Prob", 6, ">"),
-    ("Step", 7, ">"),
-    ("Prob", 6, ">"),
-]
-TABLE_WIDTH = sum(w for _, w, _ in COLUMNS) + len(GAP) * (len(COLUMNS) - 1)
-BAR_BLOCKS = " ▏▎▍▌▋▊▉█"
-
-
-def rule(char: str = "─") -> str:
-    return INDENT + dim(char * TABLE_WIDTH)
-
-
-def fmt_bp(value_pct: float, decimals: int = 1) -> str:
-    bp = value_pct * 100.0
-    if round(bp, decimals) == 0:
-        return f"{0:.{decimals}f} bp"
-    return f"{bp:+.{decimals}f} bp"
-
-
-def fmt_prob(p: float) -> str:
-    return f"{p * 100:.1f}%"
-
-
-def hbar(fraction: float, width: int = 30) -> str:
-    eighths = round(max(0.0, min(1.0, fraction)) * width * 8)
-    full, rem = divmod(eighths, 8)
-    return "█" * full + (BAR_BLOCKS[rem] if rem else "")
-
-
-def print_title(base_rate: float, as_of_date: date, source: str) -> None:
-    print()
-    print(INDENT + bold("FOMC Policy Rate Expectations (Market-Implied Model)"))
-    print(INDENT + dim(f"EFFR: {base_rate:.3f}%  ·  As of: {as_of_date}  ·  Source: {source}"))
-    print()
-
-
-def print_meeting_table(chain_results: list[dict]) -> None:
-    if not chain_results:
-        print(INDENT + dim("No pending FOMC meetings found."))
+    print("\n  \033[1mFOMC Policy Rate Expectations (Market-Implied Model)\033[0m")
+    print(f"  \033[2mEFFR: {SPOT_EFFR:.3f}%  ·  As of: {AS_OF_DATE}  ·  Source: Manual Input\033[0m\n")
+    
+    if not results:
+        print("  \033[2mNo pending FOMC meetings found.\033[0m")
         return
 
-    pair_width = COLUMNS[4][1] + len(GAP) + COLUMNS[5][1]
-    lead = sum(w for _, w, _ in COLUMNS[:4]) + len(GAP) * 4
-    group_row = (
-        INDENT
-        + " " * lead
-        + dim(f"{' Lower step ':─^{pair_width}}")
-        + GAP
-        + dim(f"{' Upper step ':─^{pair_width}}")
-    )
+    # Table Header
+    print("  \033[2m────────────────────────────────────────────────────────────────────────────────────\033[0m")
+    print("                                            \033[2m── Lower step ──  ── Upper step ──\033[0m")
+    print("  \033[1mMeeting      Pre      Post     Exp. move  Step     Prob     Step     Prob\033[0m")
+    print("  \033[2m────────────────────────────────────────────────────────────────────────────────────\033[0m")
 
-    header_cells = [f"{h:{a}{w}}" for h, w, a in COLUMNS]
-    print(rule("━"))
-    print(group_row)
-    print(INDENT + bold(GAP.join(header_cells)))
-    print(rule("─"))
+    for r in results:
+        d_str = f"{r['year']}-{r['month']:02d}-{r['day']:02d}"
+        print(f"  {d_str:<12} {r['r_pre']:.3f}%  {r['r_post']:.3f}%  "
+              f"{fmt_bp(r['exp_change']):>9}  "
+              f"{fmt_bp(r['l_step'], 0):>7}  {r['p_low']*100:>5.1f}%  "
+              f"{fmt_bp(r['u_step'], 0):>7}  {r['p_high']*100:>5.1f}%")
 
-    for m in chain_results:
-        date_str = f"{m['year']}-{m['month']:02d}-{m['decision_day']:02d}"
-        cells = [
-            date_str,
-            f"{m['r_pre']:.3f}%",
-            f"{m['r_post']:.3f}%",
-            fmt_bp(m["expected_change"]),
-            fmt_bp(m["lower_step"], decimals=0),
-            fmt_prob(m["p_low"]),
-            fmt_bp(m["upper_step"], decimals=0),
-            fmt_prob(m["p_high"]),
-        ]
-        padded = [f"{c:{a}{w}}" for c, (_, w, a) in zip(cells, COLUMNS)]
-        print(INDENT + GAP.join(padded))
-
-    print(rule("━"))
-    print(INDENT + dim("Exp. move: probability-weighted policy adjustment at each FOMC meeting."))
-
-
-def print_terminal_distribution(chain_results: list[dict], base_rate: float) -> None:
-    if not chain_results:
-        return
-
-    dist = sorted(chain_results[-1]["cumulative_dist"].items())
-    modal = max(prob for _, prob in dist) if dist else 0.0
-    last = chain_results[-1]
-    label = f"{last['year']}-{last['month']:02d}-{last['decision_day']:02d}"
-
-    print()
-    print(INDENT + bold("12-Month Horizon Cumulative Target Rate Distribution"))
-    print(INDENT + dim(f"Terminal state after {label} meeting (Base EFFR: {base_rate:.3f}%)"))
-    print()
-
-    cols = [("Target", 7, ">"), ("Change", 9, ">"), ("Prob", 6, ">")]
-    width = sum(w for _, w, _ in cols) + len(GAP) * len(cols) + 30
-    print(INDENT + dim("─" * width))
-    print(INDENT + bold(GAP.join(f"{h:{a}{w}}" for h, w, a in cols)))
-    print(INDENT + dim("─" * width))
-
+    print("  \033[2m────────────────────────────────────────────────────────────────────────────────────\033[0m")
+    
+    # Distribution Header
+    last = results[-1]
+    dist = sorted(last["cum_dist"].items())
+    modal = max(p for _, p in dist) if dist else 0.0
+    
+    print(f"\n  \033[1m12-Month Horizon Cumulative Target Rate Distribution\033[0m")
+    print(f"  \033[2mTerminal state after {last['year']}-{last['month']:02d}-{last['day']:02d} meeting\033[0m\n")
+    
+    print("  \033[2m──────────────────────────────────────────────────────────\033[0m")
+    print("  \033[1m Target    Change    Prob\033[0m")
+    print("  \033[2m──────────────────────────────────────────────────────────\033[0m")
+    
     for cum_change, prob in dist:
-        target = base_rate + cum_change
-        row = (
-            f"{f'{target:.2f}%':>7}"
-            + GAP
-            + f"{fmt_bp(cum_change):>9}"
-            + GAP
-            + f"{fmt_prob(prob):>6}"
-            + GAP
-            + hbar(prob)
-        )
+        target = SPOT_EFFR + cum_change
+        row = f"  {target:>6.2f}%  {fmt_bp(cum_change):>8}  {prob*100:>5.1f}%  {hbar(prob)}"
         if prob == modal:
-            row = bold(row)
+            print(f"\033[1m{row}\033[0m")
         elif prob < 0.01:
-            row = dim(row)
-        print(INDENT + row)
-
-    print(INDENT + dim("─" * width))
-
-
-def run_pipeline() -> None:
-    """Executes the pipeline with actual market figures."""
-    # 1. Fetch spot EFFR via FRED or NY Fed
-    base_rate, as_of_date, source_label = get_spot_effr()
-
-    # 2. Get market-implied futures curve
-    futures_rates = fetch_market_implied_rates()
-
-    # 3. Active calendar
-    active_calendar = get_active_calendar(as_of=as_of_date)
-
-    # 4. Forward chaining
-    chain_results = run_forward_chain(
-        calendar=active_calendar,
-        futures_rates=futures_rates,
-        initial_rate=base_rate,
-    )
-
-    # 5. Render
-    print_title(base_rate, as_of_date, source_label)
-    print_meeting_table(chain_results)
-    print_terminal_distribution(chain_results, base_rate)
-    print()
-
+            print(f"\033[2m{row}\033[0m")
+        else:
+            print(row)
+            
+    print("  \033[2m──────────────────────────────────────────────────────────\033[0m\n")
 
 if __name__ == "__main__":
-    run_pipeline()
+    chain_results = run_forward_chain()
+    print_dashboard(chain_results)
